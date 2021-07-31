@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+
+'''pimage
+
+Manage Raspberry PI Gentoo Linux images.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <http://www.gnu.org/licenses/>.
+'''
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+import bs4
+
+__author__ = 'Antonio Serrano Hernandez'
+__copyright__ = 'Copyright 2021'
+__license__ = 'GPLv3'
+__version__ = '0.1'
+__email__ = 'toni.serranoh@gmail.com'
+__status__ = 'Development'
+__script__ = 'pimage'
+
+
+DEFAULT_DATADIR = '/usr/local/var/lib/pimage'
+
+def _info(msg):
+    '''Print a message to stderr.'''
+    print(msg, file=sys.stderr)
+
+class Application:
+    '''Entry point.'''
+
+    def __init__(self):
+        self._args = self._parseargs()
+        self._service_interface = ServiceInterface(self._args)
+
+    def _parseargs(self):
+        parser = argparse.ArgumentParser(
+            description='Manage Raspberry PI Gentoo Linux images.',
+            prog=__script__)
+        parser.add_argument('-d', '--data', default=DEFAULT_DATADIR,
+            help='data directory.')
+        parser.add_argument('--version', action='version',
+            version=f'%(prog)s {__version__}')
+        subparsers = parser.add_subparsers(title='commands')
+
+        create = subparsers.add_parser(
+            'create', help='Create a new Raspberry PI image')
+        create.add_argument('name', help='name of the image to create')
+        create.add_argument('-a', '--arch', default='armv6j',
+            help='architecture of the newly created image')
+        create.set_defaults(func=self._create)
+
+        delete = subparsers.add_parser(
+            'delete', help='delete an existing image')
+        delete.add_argument('image', help='image to delete')
+        delete.add_argument('-f', '--force', action='store_true',
+            help="don't ask for confirmation")
+        delete.set_defaults(func=self._delete)
+
+        fork = subparsers.add_parser('fork', help='fork an existing image')
+        fork.set_defaults(func=self._fork)
+
+        list_ = subparsers.add_parser('list', help='list Raspberry PI images')
+        list_.set_defaults(func=self._list)
+        
+        return parser.parse_args()
+
+    def _create(self, args):
+        '''Create a new Raspberry PI image.'''
+        try:
+            self._service_interface.create(args.name, args.arch)
+        except ValueError as e:
+            _info(f'error: {e}')
+
+    def _delete(self, args):
+        '''Delete an existing image.'''
+        confirm = 'y' if args.force else input('are you sure? (y/[n]) ')
+        if confirm == 'y':
+            try:
+                self._service_interface.delete(args.image)
+            except ValueError as e:
+                _info(f'error: {e}')
+
+    def _fork(self, args):
+        '''Fork an existing image.'''
+        self._service_interface.fork(src, dst)
+
+    def _list(self, args):
+        '''List Raspberry PI images.'''
+        self._service_interface.list()
+
+    def main(self):
+        '''Main function.''' 
+        self._args.func(self._args)   
+
+class ServiceInterface:
+    '''An interface with the Raspberry PI image manager.'''
+
+    def __init__(self, args):
+        self._rpifiles = RpiFiles(os.path.join(args.data, 'firmware'))
+        self._gentoofiles = GentooFiles(os.path.join(args.data, 'gentoo'))
+        self._image_manager = ImageManager(
+            args.data, self._rpifiles, self._gentoofiles)
+
+    def create(self, name, arch):
+        '''Create a Raspberry PI image with the given name and architecture.'''
+        self._image_manager.create(name, arch)
+
+    def delete(self, image):
+        '''Delete a given Raspberry PI image.'''
+        self._image_manager.delete(image)
+
+    def list(self):
+        '''List the available Raspberry PI images.'''
+        self._image_manager.list()
+
+class ImageManager:
+    '''Manages the Raspberry PI images.'''
+
+    def __init__(self, datadir, rpifiles, gentoofiles):
+        self._datadir = datadir
+        self._rpifiles = rpifiles
+        self._gentoofiles = gentoofiles
+        self._load_images()
+
+    def create(self, name, arch):
+        '''Create a Raspberry PI image with the given name and architecture.'''
+        # Check that we have root permissions, otherwise the stage3 cannot be
+        # properly extracted
+        if os.geteuid() != 0:
+            raise ValueError(
+                'you must have root permissions to perform this action')
+
+        if name in self._images:
+            raise ValueError('an image with the given name already exists')
+        else:
+            # Instantiate the image
+            imagesdir = os.path.join(self._datadir, 'images')
+            if not os.path.exists(imagesdir):
+                os.mkdir(imagesdir)
+            image = Image(name, arch, os.path.join(imagesdir, name))
+
+            try:
+                # Create the image directories
+                image.mkdirs()
+
+                # Install the firmware
+                self._rpifiles.install_firmware(image.bootpath)
+
+                # Install the root tree
+                self._gentoofiles.install_stage3(image.arch, image.rootpath)
+
+                # Save the image
+                self._images[name] = image
+                self._save_images()
+            except Exception:
+                # Remove the image
+                image.remove()
+                raise
+
+    def delete(self, image):
+        '''Delete the given image.'''
+        try:
+            self._images[image].remove()
+            del self._images[image]
+            self._save_images()
+        except KeyError:
+            raise ValueError(f"unknown image '{image}'")
+
+    def list(self):
+        '''List the available Raspberry PI images.'''
+        self._print_header()
+        for image in self._images.values():
+            self._print_image(image)
+
+    @property
+    def _images_file(self):
+        '''Return the path to the images file.'''
+        return os.path.join(self._datadir, 'images.json')
+
+    def _print_header(self):
+        '''Print the header for the list of images.'''
+        print(f'{"name":20s}{"arch":20s}{"created":30s}')
+
+    def _print_image(self, image):
+        '''Print a line of information of the given image.'''
+        print(f'{image.name:20s}{image.arch:20s}{str(image.created)}')
+
+    def _load_images(self):
+        '''Load the images from the file.'''
+        try:
+            with open(self._images_file, 'r') as f:
+                jsonlist = json.loads(f.read())
+        except Exception:
+            jsonlist = {}
+        # Transform the dictionary of images to Images
+        self._images = {image['name']: Image.fromdict(image)
+            for image in jsonlist}
+
+    def _save_images(self):
+        '''Save the list of images to the file.'''
+        with open(self._images_file, 'w') as f:
+            f.write(json.dumps([x.todict() for x in self._images.values()]))
+
+class Image:
+    '''An image.'''
+
+    _ARCHS = ['armv6j', 'armv7a', 'aarch64']
+
+    def __init__(
+            self, name, arch, path, created=datetime.datetime.now()):
+        self.name = name
+        # Check that the given arch is a valid one
+        if arch not in self._ARCHS:
+            raise ValueError(f"unknown architecture '{arch}'")
+        else:
+            self.arch = arch
+        if isinstance(created, datetime.datetime):
+            self.created = created
+        else:
+            self.created = datetime.datetime.fromtimestamp(created)
+        self.path = path
+
+    @property
+    def bootpath(self):
+        '''Return the directory to the boot files of this image.'''
+        return os.path.join(self.path, 'boot')
+
+    @property
+    def rootpath(self):
+        '''Return the directory to the root files of this image.'''
+        return os.path.join(self.path, 'root')
+
+    @classmethod
+    def fromdict(cls, dictionary):
+        '''Create an Image from a dictionary.'''
+        return Image(**dictionary)
+
+    def mkdirs(self):
+        '''Create the directories of this image.'''
+        os.mkdir(self.path)
+        os.mkdir(self.bootpath)
+        os.mkdir(self.rootpath)
+
+    def remove(self):
+        '''Remove the directories of this image.'''
+        shutil.rmtree(self.path)
+
+    def todict(self):
+        '''Return a dictionary with the Image attributes.'''
+        return {'name': self.name, 'arch': self.arch, 'path': self.path,
+            'created': self.created.timestamp()}
+
+class RpiFiles:
+    '''Manage Raspberry PI files.'''
+
+    _FW_REPO = 'https://github.com/raspberrypi/firmware'
+
+    def __init__(self, path):
+        self._path = path
+        self._git_fw = Git(self._FW_REPO)
+
+    def install_firmware(self, path, download=True):
+        '''Install the Raspberry PI firmware to the given path.'''
+        # Download more recent tag, if necessary
+        self._download(download)
+
+        # Install the firmware to the given path
+        bootdir = os.path.join(self._path, 'boot')
+        shutil.copytree(bootdir, path, dirs_exist_ok=True)
+
+    @property
+    def _current_firmware(self):
+        '''Return the tag of the current downloaded firmware.'''
+        headfile = os.path.join(self._path, '.git', 'HEAD')
+        tagfile = os.path.join(self._path, 'tag')
+        try:
+            with open(headfile, 'r') as f:
+                id_ = f.read().strip()
+            with open(tagfile, 'r') as f:
+                tag = f.read().strip()
+            return tag, id_
+        except IOError:
+            return None, None
+
+    def _download(self, download):
+        '''Check the last tag in the repository.'''
+        # Check current tag/id
+        currenttag, currentid = self._current_firmware
+        _info(f'current firmware: {currenttag}')
+
+        # Get last tag/id
+        lasttag, lastid = self._git_fw.lasttag()
+        _info(f'last firmware: {lasttag}')
+
+        if download or currenttag is None:
+            if lastid == currentid:
+                _info('firmware up to date')
+            download = (lastid != currentid)
+
+        # Download more recent tag
+        if download:
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    _info(f'cloning firmware {lasttag}')
+                    self._git_fw.clone(dst=tmp, depth=1, branch=lasttag)
+
+                    # Replace the current firmware
+                    try:
+                        shutil.rmtree(self._path)
+                    except OSError: pass
+                    shutil.move(tmp, self._path)
+
+                    # Write the tag
+                    with open(os.path.join(self._path, 'tag'), 'w') as f:
+                        f.write(lasttag)
+            except Exception as e:
+                raise IOError(f'cannot download firmware: {e}')
+
+class GentooFiles:
+    '''Manage Gentoo files.'''
+
+    _BASEURL = 'https://gentoo.osuosl.org/releases/arm/autobuilds/'
+    _DIRURL = _BASEURL + 'current-stage3-{}/'
+    _FILEURL = _DIRURL + '{}'
+
+    def __init__(self, path):
+        self._path = path
+
+    def install_stage3(self, arch, path, download=True):
+        '''Install the stage3 files.'''
+        # Download more recent version, if necessary
+        self._download(arch, download)
+
+        # Extract the stage to the given path
+        current = self._current_stage3(arch)
+        _info(f'extracting stage3 {current}')
+        cmd = ['tar', 'xpf', os.path.join(self._path, current), '-C', path]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode:
+            raise RuntimeError(f'cannot extract stage3: {p.stderr}')
+
+    def _current_stage3(self, arch):
+        '''Return the current localy available stage3 version for the given
+        arch.
+        '''
+        files = glob.glob(os.path.join(self._path, f'stage3-{arch}-*.tar.*'))
+        if files:
+            return os.path.basename(files[0])
+        return None
+
+    def _download(self, arch, download):
+        '''Download the latest stage3 for the given architecture, if necessary.
+        '''
+        # Check the current stage3
+        current = self._current_stage3(arch)
+        _info(f'current stage3: {current}')
+
+        # Check the latest stage3
+        latest = self._latest_stage3(arch)
+        _info(f'latest stage3: {latest}')
+
+        # Get the latest version number
+        if download or current is None:
+            if current == latest:
+                _info('stage3 up to date')
+            download = (latest != current)
+
+        if download:
+            # Download the latest stage3 package
+            self._download_stage3(arch, latest)
+
+    def _latest_stage3(self, arch):
+        '''Get the latest stage3 version number.'''
+        with urllib.request.urlopen(self._DIRURL.format(arch)) as u:
+            contents = u.read()
+        soup = bs4.BeautifulSoup(contents, 'html.parser')
+        a = soup.find('a', href=re.compile(f'stage3-{arch}-\d+T\d+Z.tar'))
+        return a.text
+
+    def _download_stage3(self, arch, latest):
+        '''Download the latest stage3.'''
+        # First, remember the current stage3 file, if any
+        current = self._current_stage3(arch)
+
+        url = self._FILEURL.format(arch, latest)
+        _info(f'downloading stage3 {latest}')
+        with urllib.request.urlopen(url) as u:
+            # Create the target directory if it doesn't exist
+            if not os.path.exists(self._path):
+                os.mkdir(self._path)
+
+            # Download the file to a temporary file
+            dstfile = os.path.join(self._path, latest)
+            partfile = dstfile + '.part'
+            with open(partfile, 'wb') as f:
+                while 1:
+                    chunk = u.read(4096)
+                    if chunk:
+                        f.write(chunk)
+                    else:
+                        break
+
+        # Remove the old file, if any
+        if current is not None:
+            os.unlink(os.path.join(self._path, current))
+
+        # Rename the downloaded file to the final name
+        os.rename(partfile, dstfile)
+
+class Git:
+    '''Clone git repos.'''
+
+    def __init__(self, repo):
+        self._repo = repo
+
+    def clone(self, dst, depth=None, branch=None):
+        '''Clone the git repository.'''
+        cmd = ['git', 'clone']
+        if depth is not None:
+            cmd.extend(['--depth', str(depth)])
+        if branch is not None:
+            cmd.extend(['--branch', branch])
+        cmd.append(self._repo)
+        cmd.append(dst)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode:
+           raise RuntimeError(f"cannot clone repo '{self._repo}': {p.stderr}")
+
+    def lasttag(self):
+        '''Return the last tag of this repo.'''
+        cmd = ['git', '-c', 'versionsort.suffix=-', 'ls-remote', '--tags',
+            '--sort', 'v:refname', self._repo]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, encoding='ascii')
+        if p.returncode:
+            raise RuntimeError(f"cannot get lasttag of repo '{self._repo}'")
+        lastline = p.stdout.splitlines()[-1]
+        id_, other = lastline.split('\t')
+        tag = other.split('/')[-1]
+        return tag, id_
+
+if __name__ == '__main__':
+    Application().main()
+
