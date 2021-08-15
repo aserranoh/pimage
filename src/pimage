@@ -20,6 +20,7 @@ import datetime
 import glob
 import json
 import os
+import pty
 import re
 import shutil
 import subprocess
@@ -39,6 +40,7 @@ __script__ = 'pimage'
 
 
 DEFAULT_DATADIR = '/usr/local/var/lib/pimage'
+DEFAULT_STATICDIR = '/usr/local/share/pimage'
 
 def _info(msg):
     '''Print a message to stderr.'''
@@ -57,6 +59,8 @@ class Application:
             prog=__script__)
         parser.add_argument('-d', '--data', default=DEFAULT_DATADIR,
             help='data directory.')
+        parser.add_argument('-s', '--static-dir', default=DEFAULT_STATICDIR,
+            help='static files directory')
         parser.add_argument('--version', action='version',
             version=f'%(prog)s {__version__}')
         subparsers = parser.add_subparsers(title='commands')
@@ -80,8 +84,20 @@ class Application:
 
         list_ = subparsers.add_parser('list', help='list Raspberry PI images')
         list_.set_defaults(func=self._list)
-        
+
+        chroot = subparsers.add_parser(
+            'chroot', help='chroot into the given image')
+        chroot.add_argument('image', help='image to chroot into')
+        chroot.set_defaults(func=self._chroot)
+
         return parser.parse_args()
+
+    def _chroot(self, args):
+        '''Chroot into the given Raspberry PI image.'''
+        try:
+            self._service_interface.chroot(args.image)
+        except ValueError as e:
+            _info(f'error: {e}')
 
     def _create(self, args):
         '''Create a new Raspberry PI image.'''
@@ -118,7 +134,11 @@ class ServiceInterface:
         self._rpifiles = RpiFiles(os.path.join(args.data, 'firmware'))
         self._gentoofiles = GentooFiles(os.path.join(args.data, 'gentoo'))
         self._image_manager = ImageManager(
-            args.data, self._rpifiles, self._gentoofiles)
+            args.data, args.static_dir, self._rpifiles, self._gentoofiles)
+
+    def chroot(self, image):
+        '''Chroot into the given image.'''
+        self._image_manager.chroot(image)
 
     def create(self, name, arch):
         '''Create a Raspberry PI image with the given name and architecture.'''
@@ -135,11 +155,94 @@ class ServiceInterface:
 class ImageManager:
     '''Manages the Raspberry PI images.'''
 
-    def __init__(self, datadir, rpifiles, gentoofiles):
+    _ARM_EXEC_TAG = (r':arm:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00'
+        r'\x00\x00\x02\x00\x28\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff'
+        r'\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-arm:')
+
+    def __init__(self, datadir, staticdir, rpifiles, gentoofiles):
         self._datadir = datadir
+        self._staticdir = staticdir
         self._rpifiles = rpifiles
         self._gentoofiles = gentoofiles
         self._load_images()
+
+    def _setup_repos(self, image):
+        '''Copy the template repos file to the final location.'''
+        reposdir = os.path.join(image.rootpath, 'etc', 'portage', 'repos.conf')
+        try:
+            os.mkdir(reposdir)
+        except OSError: pass
+        src = os.path.join(
+            image.rootpath, 'usr', 'share', 'portage', 'config', 'repos.conf')
+        dst = os.path.join(reposdir, 'gentoo.conf')
+        shutil.copy(src, dst)
+
+    def _install_qemu(self, image):
+        '''Install the qemu ARM binary to the newly created image.'''
+        # Copy the qemu-arm binary to the target image
+        src = os.path.join(self._staticdir, 'qemu', 'qemu-arm')
+        dst = os.path.join(image.rootpath, 'usr', 'bin', 'qemu-arm')
+        shutil.copy(src, dst)
+
+        # Tune the make.conf of the target image to avoid known problems
+        makeconf = os.path.join(image.rootpath, 'etc', 'portage', 'make.conf')
+        with open(makeconf, 'a') as f:
+            f.write('\nFEATURES="-pid-sandbox -network-sandbox -sandbox '
+                '-usersandbox buildpkg"\n')
+
+    def chroot(self, image):
+        '''Chroot into the given image.'''
+        # Check that we have root permissions, otherwise chroot cannot be
+        # performed
+        if os.geteuid() != 0:
+            raise ValueError(
+                'you must have root permissions to perform this action')
+        try:
+            # Get the image
+            img = self._images[image]
+
+            # Build some paths in the image
+            imgdev = os.path.join(img.rootpath, 'dev')
+            imgproc = os.path.join(img.rootpath, 'proc')
+            imgsys = os.path.join(img.rootpath, 'sys')
+            imgdevpts = os.path.join(img.rootpath, 'dev', 'pts')
+            bootdir = os.path.join(img.rootpath, 'boot')
+
+            # Options to mount devpts
+            opts = ['rw', 'nosuid', 'noexec', 'relatime', 'gid=5', 'mode=620',
+                'ptmxmode=000']
+
+            # Register ARM executable format
+            self._register_executable()
+
+            # Mount portage tree
+            with Mount(self._gentoofiles.portagedir, img.portagedir,
+                    options=['bind'], lazy=True):
+                # Mount distfiles
+                with Mount(self._gentoofiles.distfilesdir, img.distfilesdir,
+                        options=['bind'], lazy=True):
+                    # Mount binpkg
+                    with Mount(self._gentoofiles.binpkgdir, img.binpkgdir,
+                            options=['bind']):
+                        # Mount boot
+                        with Mount(img.bootpath, bootdir, options=['bind']):
+                            # Mount dev filesystem                        
+                            with Mount('/dev', imgdev, options=['bind']):
+                                # Mount proc filesystem
+                                with Mount('/proc', imgproc, options=['bind']):
+                                    # Mount sys filesystem                    
+                                    with Mount('/sys', imgsys,
+                                            options=['bind']):
+                                        # Mount devpts filesystem
+                                        with Mount('devpts', imgdevpts,
+                                                lazy=True, options=opts,
+                                                type='devpts',):
+                                            # Copy DNS info
+                                            self._copy_dns_info(img)
+                                            # Chroot
+                                            pty.spawn(['chroot', img.rootpath])
+        except KeyError:
+            raise ValueError(f"unknown image '{image}'")
 
     def create(self, name, arch):
         '''Create a Raspberry PI image with the given name and architecture.'''
@@ -165,8 +268,18 @@ class ImageManager:
                 # Install the firmware
                 self._rpifiles.install_firmware(image.bootpath)
 
+                # Record the version of the installed firmware
+                tag, id_ = self._rpifiles.current_firmware
+                image.set_firmware_version(tag)
+
                 # Install the root tree
                 self._gentoofiles.install_stage3(image.arch, image.rootpath)
+
+                # Copy repos files
+                self._setup_repos(image)
+
+                # Install qemu ARM binary
+                self._install_qemu(image)
 
                 # Save the image
                 self._images[name] = image
@@ -198,11 +311,12 @@ class ImageManager:
 
     def _print_header(self):
         '''Print the header for the list of images.'''
-        print(f'{"name":20s}{"arch":20s}{"created":30s}')
+        print(f'{"name":20s}{"arch":15s}{"created":30s}{"firmware":30s}')
 
     def _print_image(self, image):
         '''Print a line of information of the given image.'''
-        print(f'{image.name:20s}{image.arch:20s}{str(image.created)}')
+        print(f'{image.name:20s}{image.arch:15s}{str(image.created):30s}'
+            f'{str(image.firmware):30s}')
 
     def _load_images(self):
         '''Load the images from the file.'''
@@ -217,8 +331,24 @@ class ImageManager:
 
     def _save_images(self):
         '''Save the list of images to the file.'''
-        with open(self._images_file, 'w') as f:
+        partfile = self._images_file + '.part'
+        with open(partfile, 'w') as f:
             f.write(json.dumps([x.todict() for x in self._images.values()]))
+        os.rename(partfile, self._images_file)
+
+    def _register_executable(self):
+        '''Register the arm executable with qemu.'''
+        try:
+            with open('/proc/sys/fs/binfmt_misc/register', 'w') as f:
+                f.write(self._ARM_EXEC_TAG)
+        except FileExistsError:
+            pass
+
+    def _copy_dns_info(self, image):
+        '''Copy the host's DNS info to the image.'''
+        src = '/etc/resolv.conf'
+        dst = os.path.join(image.rootpath, 'etc', 'resolv.conf')
+        shutil.copy(src, dst)
 
 class Image:
     '''An image.'''
@@ -226,7 +356,8 @@ class Image:
     _ARCHS = ['armv6j', 'armv7a', 'aarch64']
 
     def __init__(
-            self, name, arch, path, created=datetime.datetime.now()):
+            self, name, arch, path, created=datetime.datetime.now(),
+            firmware=None):
         self.name = name
         # Check that the given arch is a valid one
         if arch not in self._ARCHS:
@@ -238,6 +369,7 @@ class Image:
         else:
             self.created = datetime.datetime.fromtimestamp(created)
         self.path = path
+        self._firmware = firmware
 
     @property
     def bootpath(self):
@@ -248,6 +380,36 @@ class Image:
     def rootpath(self):
         '''Return the directory to the root files of this image.'''
         return os.path.join(self.path, 'root')
+
+    @property
+    def portagedir(self):
+        '''Return the portage dir of this image.'''
+        # Create the directory if it doesn't exist
+        path = os.path.join(self.rootpath, 'var', 'db', 'repos', 'gentoo')
+        if not os.path.exists(path):
+            os.mkdir(path)
+        return path
+
+    @property
+    def distfilesdir(self):
+        '''Return the distfiles dir of this image.'''
+        path = os.path.join(self.rootpath, 'var', 'cache', 'distfiles')
+        if not os.path.exists(path):
+            os.mkdir(path)
+        return path
+
+    @property
+    def binpkgdir(self):
+        '''Return the binpkg dir of this image.'''
+        path = os.path.join(self.rootpath, 'var', 'cache', 'binpkgs')
+        if not os.path.exists(path):
+            os.mkdir(path)
+        return path
+
+    @property
+    def firmware(self):
+        '''Return the firmware version with which this image was created.'''
+        return self._firmware
 
     @classmethod
     def fromdict(cls, dictionary):
@@ -264,15 +426,21 @@ class Image:
         '''Remove the directories of this image.'''
         shutil.rmtree(self.path)
 
+    def set_firmware_version(self, version):
+        '''Set the firmware version installed in this image.'''
+        self._firmware = version
+
     def todict(self):
         '''Return a dictionary with the Image attributes.'''
         return {'name': self.name, 'arch': self.arch, 'path': self.path,
-            'created': self.created.timestamp()}
+            'created': self.created.timestamp(), 'firmware': self._firmware}
 
 class RpiFiles:
     '''Manage Raspberry PI files.'''
 
     _FW_REPO = 'https://github.com/raspberrypi/firmware'
+
+    # TODO: remove git, use releases
 
     def __init__(self, path):
         self._path = path
@@ -288,7 +456,7 @@ class RpiFiles:
         shutil.copytree(bootdir, path, dirs_exist_ok=True)
 
     @property
-    def _current_firmware(self):
+    def current_firmware(self):
         '''Return the tag of the current downloaded firmware.'''
         headfile = os.path.join(self._path, '.git', 'HEAD')
         tagfile = os.path.join(self._path, 'tag')
@@ -304,7 +472,7 @@ class RpiFiles:
     def _download(self, download):
         '''Check the last tag in the repository.'''
         # Check current tag/id
-        currenttag, currentid = self._current_firmware
+        currenttag, currentid = self.current_firmware
         _info(f'current firmware: {currenttag}')
 
         # Get last tag/id
@@ -341,14 +509,40 @@ class GentooFiles:
     _BASEURL = 'https://gentoo.osuosl.org/releases/arm/autobuilds/'
     _DIRURL = _BASEURL + 'current-stage3-{}/'
     _FILEURL = _DIRURL + '{}'
+    _PORTAGEURL = 'https://gentoo.osuosl.org/snapshots/gentoo-latest.tar.xz'
 
     def __init__(self, path):
         self._path = path
 
+    @property
+    def portagedir(self):
+        '''Return the directory with the portage tree.'''
+        portage = os.path.join(self._path, 'portage')
+        if not os.path.exists(portage):
+            self._download_portage()
+        portage = os.path.join(portage, os.listdir(portage)[0])
+        return portage
+
+    @property
+    def distfilesdir(self):
+        '''Return the directory with the distributed files.'''
+        distfiles = os.path.join(self._path, 'distfiles')
+        if not os.path.exists(distfiles):
+            os.mkdir(distfiles)
+        return distfiles
+
+    @property
+    def binpkgdir(self):
+        '''Return the directory with the bin packages.'''
+        binpkg = os.path.join(self._path, 'binpkg')
+        if not os.path.exists(binpkg):
+            os.mkdir(binpkg)
+        return binpkg
+
     def install_stage3(self, arch, path, download=True):
         '''Install the stage3 files.'''
         # Download more recent version, if necessary
-        self._download(arch, download)
+        self._download_stage3(arch, download)
 
         # Extract the stage to the given path
         current = self._current_stage3(arch)
@@ -362,12 +556,13 @@ class GentooFiles:
         '''Return the current localy available stage3 version for the given
         arch.
         '''
-        files = glob.glob(os.path.join(self._path, f'stage3-{arch}-*.tar.*'))
+        files = glob.glob(os.path.join(
+            self._path, f'stage3-{arch}_hardfp-*.tar.*'))
         if files:
             return os.path.basename(files[0])
         return None
 
-    def _download(self, arch, download):
+    def _download_stage3(self, arch, download):
         '''Download the latest stage3 for the given architecture, if necessary.
         '''
         # Check the current stage3
@@ -385,31 +580,49 @@ class GentooFiles:
             download = (latest != current)
 
         if download:
-            # Download the latest stage3 package
-            self._download_stage3(arch, latest)
+            # Create the target directory if it doesn't exist
+            if not os.path.exists(self._path):
+                os.mkdir(self._path)
+
+            url = self._FILEURL.format(arch, latest)
+            _info(f'downloading stage3 {latest}')
+            dstfile = os.path.join(self._path, latest)
+            self._download_file(url, dstfile)
+
+            # Remove the old file, if any
+            if current is not None:
+                os.unlink(os.path.join(self._path, current))
 
     def _latest_stage3(self, arch):
         '''Get the latest stage3 version number.'''
         with urllib.request.urlopen(self._DIRURL.format(arch)) as u:
             contents = u.read()
         soup = bs4.BeautifulSoup(contents, 'html.parser')
-        a = soup.find('a', href=re.compile(f'stage3-{arch}-\d+T\d+Z.tar'))
-        return a.text
+        a = soup.find('a', href=re.compile(
+            f'stage3-{arch}_hardfp-\d+T\d+Z.tar'))
+        return a.text        
 
-    def _download_stage3(self, arch, latest):
-        '''Download the latest stage3.'''
-        # First, remember the current stage3 file, if any
-        current = self._current_stage3(arch)
+    def _download_portage(self):
+        '''Download the latest portage tree.'''
+        _info('downloading portage tree')
+        with tempfile.TemporaryDirectory() as tmp:
+            dstfile = os.path.join(tmp, self._PORTAGEURL.split('/')[-1])
+            self._download_file(self._PORTAGEURL, dstfile)
 
-        url = self._FILEURL.format(arch, latest)
-        _info(f'downloading stage3 {latest}')
+            # Extract the portage tree to the given path
+            portagepath = os.path.join(self._path, 'portage')
+            os.mkdir(portagepath)
+            cmd = ['tar', 'xpf', dstfile, '-C', portagepath]
+            p = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if p.returncode:
+                raise RuntimeError(
+                    f'cannot extract portage snapshot: {p.stderr}')
+
+    def _download_file(self, url, dstfile):
+        '''Download a file.'''
         with urllib.request.urlopen(url) as u:
-            # Create the target directory if it doesn't exist
-            if not os.path.exists(self._path):
-                os.mkdir(self._path)
-
             # Download the file to a temporary file
-            dstfile = os.path.join(self._path, latest)
             partfile = dstfile + '.part'
             with open(partfile, 'wb') as f:
                 while 1:
@@ -420,8 +633,9 @@ class GentooFiles:
                         break
 
         # Remove the old file, if any
-        if current is not None:
-            os.unlink(os.path.join(self._path, current))
+        try:
+            os.unlink(dstfile)
+        except OSError: pass
 
         # Rename the downloaded file to the final name
         os.rename(partfile, dstfile)
@@ -456,6 +670,45 @@ class Git:
         id_, other = lastline.split('\t')
         tag = other.split('/')[-1]
         return tag, id_
+
+class Mount:
+    '''Mount a filesystem.'''
+
+    def __init__(self, filesystem, path, options=None, type=None, lazy=False):
+        self._filesystem = filesystem
+        self._path = path
+        self._options = options
+        self._type = type
+        self._lazy = lazy
+
+    def __enter__(self):
+        '''Mount the filesystem.'''
+        # Prepare the command
+        cmd = ['mount']
+        if self._options is not None:
+            cmd.extend(['-o', ','.join(self._options)])
+        if self._type is not None:
+            cmd.extend(['-t', self._type])
+        cmd.extend([self._filesystem, self._path])
+
+        # Run the command
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode:
+            raise RuntimeError(
+                f"unable to mount '{self._filesystem}': {p.stderr}")
+
+    def __exit__(self, *args):
+        '''Umount the filesystem.'''
+        # Prepare the command
+        cmd = ['umount', self._path]
+        if self._lazy:
+            cmd.append('-l')
+
+        # Run the command
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode:
+            raise RuntimeError(
+                f"unable to unmount '{self._path}': {p.stderr}")
 
 if __name__ == '__main__':
     Application().main()
