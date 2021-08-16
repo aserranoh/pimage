@@ -82,6 +82,15 @@ class Application:
         fork = subparsers.add_parser('fork', help='fork an existing image')
         fork.set_defaults(func=self._fork)
 
+        install = subparsers.add_parser(
+            'install', help='install an existing image to a given device')
+        install.add_argument('image', help='image to install')
+        install.add_argument(
+            'device', help='device where to install the image')
+        install.add_argument('-f', '--force', action='store_true',
+            help="don't ask for confirmation")
+        install.set_defaults(func=self._install)
+
         list_ = subparsers.add_parser('list', help='list Raspberry PI images')
         list_.set_defaults(func=self._list)
 
@@ -94,30 +103,23 @@ class Application:
 
     def _chroot(self, args):
         '''Chroot into the given Raspberry PI image.'''
-        try:
-            self._service_interface.chroot(args.image)
-        except ValueError as e:
-            _info(f'error: {e}')
+        self._service_interface.chroot(args.image)
 
     def _create(self, args):
         '''Create a new Raspberry PI image.'''
-        try:
-            self._service_interface.create(args.name, args.arch)
-        except ValueError as e:
-            _info(f'error: {e}')
+        self._service_interface.create(args.name, args.arch)
 
     def _delete(self, args):
         '''Delete an existing image.'''
-        confirm = 'y' if args.force else input('are you sure? (y/[n]) ')
-        if confirm == 'y':
-            try:
-                self._service_interface.delete(args.image)
-            except ValueError as e:
-                _info(f'error: {e}')
+        self._service_interface.delete(args.image, args.force)
 
     def _fork(self, args):
         '''Fork an existing image.'''
         self._service_interface.fork(src, dst)
+
+    def _install(self, args):
+        '''Install the given image.'''
+        self._service_interface.install(args.image, args.device)
 
     def _list(self, args):
         '''List Raspberry PI images.'''
@@ -136,17 +138,54 @@ class ServiceInterface:
         self._image_manager = ImageManager(
             args.data, args.static_dir, self._rpifiles, self._gentoofiles)
 
+    def _asroot(f):
+        '''Execute the given function only if the current user is root.'''
+        def execute_if_root(*args):
+            if os.geteuid() == 0:
+                f(*args)
+            else:
+                _info('error: you must have root permissions '
+                    'to perform this action')
+        return execute_if_root
+
+    @_asroot
     def chroot(self, image):
         '''Chroot into the given image.'''
-        self._image_manager.chroot(image)
+        try:
+            self._image_manager.chroot(image)
+        except ValueError as e:
+            _info(f'error: {e}')
 
+    @_asroot
     def create(self, name, arch):
         '''Create a Raspberry PI image with the given name and architecture.'''
-        self._image_manager.create(name, arch)
+        try:
+            self._image_manager.create(name, arch)
+        except ValueError as e:
+            _info(f'error: {e}')
 
-    def delete(self, image):
+    def delete(self, image, force=False):
         '''Delete a given Raspberry PI image.'''
-        self._image_manager.delete(image)
+        confirm = 'y' if force else input('are you sure? (y/[n]) ')
+        if confirm == 'y':
+            try:
+                self._image_manager.delete(image)
+            except ValueError as e:
+                _info(f'error: {e}')
+
+    @_asroot
+    def install(self, image, device, force=False):
+        '''Install the given image onto the given device.'''
+        # Ask for confirmation to partition the device
+        confirm = 'y' if force else input(f'WARNING!! all data in device '
+            f'{device} will be destroyed, are you sure? (y/[n]) ')
+        if confirm == 'y':
+            try:
+                self._image_manager.install(image, device)
+            except RuntimeError as e:
+                _info(f'error: {e}')
+        else:
+            _info('aborting')
 
     def list(self):
         '''List the available Raspberry PI images.'''
@@ -166,37 +205,8 @@ class ImageManager:
         self._gentoofiles = gentoofiles
         self._load_images()
 
-    def _setup_repos(self, image):
-        '''Copy the template repos file to the final location.'''
-        reposdir = os.path.join(image.rootpath, 'etc', 'portage', 'repos.conf')
-        try:
-            os.mkdir(reposdir)
-        except OSError: pass
-        src = os.path.join(
-            image.rootpath, 'usr', 'share', 'portage', 'config', 'repos.conf')
-        dst = os.path.join(reposdir, 'gentoo.conf')
-        shutil.copy(src, dst)
-
-    def _install_qemu(self, image):
-        '''Install the qemu ARM binary to the newly created image.'''
-        # Copy the qemu-arm binary to the target image
-        src = os.path.join(self._staticdir, 'qemu', 'qemu-arm')
-        dst = os.path.join(image.rootpath, 'usr', 'bin', 'qemu-arm')
-        shutil.copy(src, dst)
-
-        # Tune the make.conf of the target image to avoid known problems
-        makeconf = os.path.join(image.rootpath, 'etc', 'portage', 'make.conf')
-        with open(makeconf, 'a') as f:
-            f.write('\nFEATURES="-pid-sandbox -network-sandbox -sandbox '
-                '-usersandbox buildpkg"\n')
-
     def chroot(self, image):
         '''Chroot into the given image.'''
-        # Check that we have root permissions, otherwise chroot cannot be
-        # performed
-        if os.geteuid() != 0:
-            raise ValueError(
-                'you must have root permissions to perform this action')
         try:
             # Get the image
             img = self._images[image]
@@ -246,12 +256,6 @@ class ImageManager:
 
     def create(self, name, arch):
         '''Create a Raspberry PI image with the given name and architecture.'''
-        # Check that we have root permissions, otherwise the stage3 cannot be
-        # properly extracted
-        if os.geteuid() != 0:
-            raise ValueError(
-                'you must have root permissions to perform this action')
-
         if name in self._images:
             raise ValueError('an image with the given name already exists')
         else:
@@ -274,6 +278,9 @@ class ImageManager:
 
                 # Install the root tree
                 self._gentoofiles.install_stage3(image.arch, image.rootpath)
+
+                # Install modules
+                self._rpifiles.install_modules(image.rootpath)
 
                 # Copy repos files
                 self._setup_repos(image)
@@ -298,6 +305,28 @@ class ImageManager:
         except KeyError:
             raise ValueError(f"unknown image '{image}'")
 
+    def install(self, image, device):
+        '''Install the image onto the given device.'''
+        try:
+            # Get the image
+            img = self._images[image]
+
+            # Partition the device
+            self._partition(device)
+
+            # Create the filesystems in the device's partitions
+            self._create_filesystems(device)
+
+            # Mount the partitions
+            with tempfile.TemporaryDirectory() as tmpboot:
+                with tempfile.TemporaryDirectory() as tmproot:
+                    with Mount(f'{device}1', tmpboot, lazy=True):
+                        with Mount(f'{device}3', tmproot, lazy=True):
+                            # Copy files
+                            self._copy_files(img, tmpboot, tmproot)
+        except KeyError:
+            raise ValueError(f"unknown image '{image}'")
+
     def list(self):
         '''List the available Raspberry PI images.'''
         self._print_header()
@@ -308,6 +337,30 @@ class ImageManager:
     def _images_file(self):
         '''Return the path to the images file.'''
         return os.path.join(self._datadir, 'images.json')
+
+    def _setup_repos(self, image):
+        '''Copy the template repos file to the final location.'''
+        reposdir = os.path.join(image.rootpath, 'etc', 'portage', 'repos.conf')
+        try:
+            os.mkdir(reposdir)
+        except OSError: pass
+        src = os.path.join(
+            image.rootpath, 'usr', 'share', 'portage', 'config', 'repos.conf')
+        dst = os.path.join(reposdir, 'gentoo.conf')
+        shutil.copy(src, dst)
+
+    def _install_qemu(self, image):
+        '''Install the qemu ARM binary to the newly created image.'''
+        # Copy the qemu-arm binary to the target image
+        src = os.path.join(self._staticdir, 'qemu', 'qemu-arm')
+        dst = os.path.join(image.rootpath, 'usr', 'bin', 'qemu-arm')
+        shutil.copy(src, dst)
+
+        # Tune the make.conf of the target image to avoid known problems
+        makeconf = os.path.join(image.rootpath, 'etc', 'portage', 'make.conf')
+        with open(makeconf, 'a') as f:
+            f.write('\nFEATURES="-pid-sandbox -network-sandbox -sandbox '
+                '-usersandbox buildpkg"\n')
 
     def _print_header(self):
         '''Print the header for the list of images.'''
@@ -349,6 +402,74 @@ class ImageManager:
         src = '/etc/resolv.conf'
         dst = os.path.join(image.rootpath, 'etc', 'resolv.conf')
         shutil.copy(src, dst)
+
+    def _partition(self, device):
+        '''Partition the device to prepare it for the image files.'''
+        _info(f'partitioning {device}')
+        cmd = ['parted', '-a', 'optimal', '--script', device,
+            'mklabel', 'msdos',
+            'unit', 'mib',
+            'mkpart', 'primary', 'fat32', '1', '65',
+            'mkpart', 'primary', 'linux-swap', '65', '577',
+            'mkpart', 'primary', '577', '100%']
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode:
+            raise RuntimeError(f'cannot partition device {device}: '
+                f'{p.stderr.decode("utf-8").strip()}')
+
+        subprocess.run(
+            ['partprobe'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _create_filesystems(self, device):
+        '''Create the boot and root filesystems in device and setup swap.'''
+        _info('creating boot filesystem')
+        cmd = ['mkfs.fat', '-F', '32', f'{device}1']
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode:
+            raise RuntimeError(f'cannot create boot filesystem: '
+                f'{p.stderr.decode("utf-8").strip()}')
+
+        _info('creating root filesystem')
+        cmd = ['mkfs.f2fs', '-f', f'{device}3']
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode:
+            _info(f'cannot create root F2FS filesystem: '
+                f'{p.stderr.decode("utf-8").strip()}')
+            _info('trying with EXT4')
+            cmd = ['mkfs.ext4', '-T', 'small', f'{device}3']
+            p = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if p.returncode:
+                raise RuntimeError(
+                    f'cannot create root EXT4 filesystem: '
+                        f'{p.stderr.decode("utf-8").strip()}')
+
+        _info('setting up swap space')
+        cmd = ['mkswap', '-f', f'{device}2']
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode:
+            raise RuntimeError(f'cannot create swap space: '
+                f'{p.stderr.decode("utf-8").strip()}')
+
+    def _copy_files(self, image, bootdir, rootdir):
+        '''Copy the files from the image to the physical directories.'''
+        _info('copying boot files')
+        self._copy_contents(image.bootpath, bootdir)
+
+        _info('copying root files')
+        self._copy_contents(image.rootpath, rootdir)
+
+        _info('syncing')
+        os.sync()
+
+    def _copy_contents(self, src, dst):
+        '''Copy the contents of the directory src into the directory dst.'''
+        for x in os.listdir(src):
+            f = os.path.join(src, x)
+            if os.path.isdir(f):
+                shutil.copytree(f, os.path.join(dst, x), symlinks=True)
+            else:
+                shutil.copy2(f, dst, follow_symlinks=False)
 
 class Image:
     '''An image.'''
@@ -452,8 +573,16 @@ class RpiFiles:
         self._download(download)
 
         # Install the firmware to the given path
+        _info('installing firmware')
         bootdir = os.path.join(self._path, 'boot')
         shutil.copytree(bootdir, path, dirs_exist_ok=True)
+
+    def install_modules(self, path):
+        '''Intall the modules that come with the firmware to the given path.'''
+        _info('installing kernel modules')
+        src = os.path.join(self._path, 'modules')
+        dst = os.path.join(path, 'lib', 'modules')
+        shutil.copytree(src, dst)
 
     @property
     def current_firmware(self):
@@ -550,7 +679,8 @@ class GentooFiles:
         cmd = ['tar', 'xpf', os.path.join(self._path, current), '-C', path]
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode:
-            raise RuntimeError(f'cannot extract stage3: {p.stderr}')
+            raise RuntimeError(
+                f'cannot extract stage3: {p.stderr.decode("utf-8").strip()}')
 
     def _current_stage3(self, arch):
         '''Return the current localy available stage3 version for the given
@@ -616,8 +746,8 @@ class GentooFiles:
             p = subprocess.run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if p.returncode:
-                raise RuntimeError(
-                    f'cannot extract portage snapshot: {p.stderr}')
+                raise RuntimeError(f'cannot extract portage snapshot: '
+                    f'{p.stderr.decode("utf-8").strip()}')
 
     def _download_file(self, url, dstfile):
         '''Download a file.'''
@@ -657,7 +787,8 @@ class Git:
         cmd.append(dst)
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode:
-           raise RuntimeError(f"cannot clone repo '{self._repo}': {p.stderr}")
+           raise RuntimeError(f"cannot clone repo '{self._repo}': "
+                f"{p.stderr.decode('utf-8').strip()}")
 
     def lasttag(self):
         '''Return the last tag of this repo.'''
@@ -694,8 +825,8 @@ class Mount:
         # Run the command
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode:
-            raise RuntimeError(
-                f"unable to mount '{self._filesystem}': {p.stderr}")
+            raise RuntimeError(f"unable to mount '{self._filesystem}': "
+                f"{p.stderr.encode('utf-8').strip()}")
 
     def __exit__(self, *args):
         '''Umount the filesystem.'''
@@ -707,8 +838,8 @@ class Mount:
         # Run the command
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode:
-            raise RuntimeError(
-                f"unable to unmount '{self._path}': {p.stderr}")
+            raise RuntimeError(f"unable to unmount '{self._path}': "
+                f"{p.stderr.encode('utf-8').strip()}")
 
 if __name__ == '__main__':
     Application().main()
