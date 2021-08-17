@@ -80,6 +80,8 @@ class Application:
         delete.set_defaults(func=self._delete)
 
         fork = subparsers.add_parser('fork', help='fork an existing image')
+        fork.add_argument('image', help='image to fork')
+        fork.add_argument('newimage', help='new image to create')
         fork.set_defaults(func=self._fork)
 
         install = subparsers.add_parser(
@@ -99,6 +101,11 @@ class Application:
         chroot.add_argument('image', help='image to chroot into')
         chroot.set_defaults(func=self._chroot)
 
+        rename = subparsers.add_parser('rename', help='rename an image')
+        rename.add_argument('image', help='image to rename')
+        rename.add_argument('newname', help='new name of the image')
+        rename.set_defaults(func=self._rename)
+
         return parser.parse_args()
 
     def _chroot(self, args):
@@ -115,7 +122,7 @@ class Application:
 
     def _fork(self, args):
         '''Fork an existing image.'''
-        self._service_interface.fork(src, dst)
+        self._service_interface.fork(args.image, args.newimage)
 
     def _install(self, args):
         '''Install the given image.'''
@@ -124,6 +131,10 @@ class Application:
     def _list(self, args):
         '''List Raspberry PI images.'''
         self._service_interface.list()
+
+    def _rename(self, args):
+        '''Rename an image.'''
+        self._service_interface.rename(args.image, args.newname)
 
     def main(self):
         '''Main function.''' 
@@ -174,6 +185,14 @@ class ServiceInterface:
                 _info(f'error: {e}')
 
     @_asroot
+    def fork(self, src, dst):
+        '''Fork an image.'''
+        try:
+            self._image_manager.fork(src, dst)
+        except ValueError as e:
+            _info(f'error: {e}')
+
+    @_asroot
     def install(self, image, device, force=False):
         '''Install the given image onto the given device.'''
         # Ask for confirmation to partition the device
@@ -190,6 +209,14 @@ class ServiceInterface:
     def list(self):
         '''List the available Raspberry PI images.'''
         self._image_manager.list()
+
+    @_asroot
+    def rename(self, image, newname):
+        '''Rename an existing image.'''
+        try:
+            self._image_manager.rename(image, newname)
+        except ValueError as e:
+            _info(f'error: {e}')
 
 class ImageManager:
     '''Manages the Raspberry PI images.'''
@@ -305,6 +332,21 @@ class ImageManager:
         except KeyError:
             raise ValueError(f"unknown image '{image}'")
 
+    def fork(self, src, dst):
+        '''Fork and image.'''
+        if dst in self._images:
+            raise ValueError(f"an image with name '{newname}' already exists")
+        try:
+            oldimage = self._images[src]
+            newimage = oldimage.clone()
+            newimage.rename(dst)
+            self._images[dst] = newimage
+            _info('copying files')
+            shutil.copytree(oldimage.path, newimage.path, symlinks=True)
+            self._save_images()
+        except KeyError:
+            raise ValueError(f"unknown image '{image}'")
+
     def install(self, image, device):
         '''Install the image onto the given device.'''
         try:
@@ -332,6 +374,16 @@ class ImageManager:
         self._print_header()
         for image in self._images.values():
             self._print_image(image)
+
+    def rename(self, image, newname):
+        '''Rename the given image with the new name.'''
+        if newname in self._images:
+            raise ValueError(f"an image with name '{newname}' already exists")
+        try:
+            self._images[image].rename(newname, rename_path=True)
+            self._save_images()
+        except KeyError:
+            raise ValueError(f"unknown image '{image}'")
 
     @property
     def _images_file(self):
@@ -364,12 +416,14 @@ class ImageManager:
 
     def _print_header(self):
         '''Print the header for the list of images.'''
-        print(f'{"name":20s}{"arch":15s}{"created":30s}{"firmware":30s}')
+        print(f'{"name":20s}{"arch":10s}{"created":22s}{"firmware":15s}'
+            f'{"parent":20s}')
 
     def _print_image(self, image):
         '''Print a line of information of the given image.'''
-        print(f'{image.name:20s}{image.arch:15s}{str(image.created):30s}'
-            f'{str(image.firmware):30s}')
+        print(f'{image.name:20s}{image.arch:10s}'
+            f'{str(image.created.strftime("%Y-%m-%d %H:%M:%S")):22s}'
+            f'{str(image.firmware):15s}{str(image.parent):20s}')
 
     def _load_images(self):
         '''Load the images from the file.'''
@@ -478,7 +532,7 @@ class Image:
 
     def __init__(
             self, name, arch, path, created=datetime.datetime.now(),
-            firmware=None):
+            firmware=None, parent=None):
         self.name = name
         # Check that the given arch is a valid one
         if arch not in self._ARCHS:
@@ -490,7 +544,8 @@ class Image:
         else:
             self.created = datetime.datetime.fromtimestamp(created)
         self.path = path
-        self._firmware = firmware
+        self.firmware = firmware
+        self.parent = parent
 
     @property
     def bootpath(self):
@@ -527,15 +582,15 @@ class Image:
             os.mkdir(path)
         return path
 
-    @property
-    def firmware(self):
-        '''Return the firmware version with which this image was created.'''
-        return self._firmware
-
     @classmethod
     def fromdict(cls, dictionary):
         '''Create an Image from a dictionary.'''
         return Image(**dictionary)
+
+    def clone(self):
+        '''Return a copy of this image.'''
+        return Image(self.name, self.arch, self.path, firmware=self.firmware,
+            parent=self.name)
 
     def mkdirs(self):
         '''Create the directories of this image.'''
@@ -547,14 +602,24 @@ class Image:
         '''Remove the directories of this image.'''
         shutil.rmtree(self.path)
 
+    def rename(self, newname, rename_path=False):
+        '''Rename this image with the new name.'''
+        self.name = newname
+        oldpath = self.path
+        head, tail = os.path.split(self.path)
+        self.path = os.path.join(head, self.name)
+        if rename_path:
+            os.rename(oldpath, self.path)
+
     def set_firmware_version(self, version):
         '''Set the firmware version installed in this image.'''
-        self._firmware = version
+        self.firmware = version
 
     def todict(self):
         '''Return a dictionary with the Image attributes.'''
         return {'name': self.name, 'arch': self.arch, 'path': self.path,
-            'created': self.created.timestamp(), 'firmware': self._firmware}
+            'created': self.created.timestamp(), 'firmware': self.firmware,
+            'parent': self.parent}
 
 class RpiFiles:
     '''Manage Raspberry PI files.'''
