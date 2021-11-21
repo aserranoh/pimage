@@ -39,8 +39,8 @@ __status__ = 'Development'
 __script__ = 'pimage'
 
 
-DEFAULT_DATADIR = '/usr/local/var/lib/pimage'
-DEFAULT_STATICDIR = '/usr/local/share/pimage'
+DEFAULT_DATADIR = '/var/lib/pimage'
+DEFAULT_STATICDIR = '/usr/share/pimage'
 
 def _info(msg):
     '''Print a message to stderr.'''
@@ -69,6 +69,7 @@ class Application:
             'create', help='Create a new Raspberry PI image')
         create.add_argument('name', help='name of the image to create')
         create.add_argument('-a', '--arch', default='armv6j',
+            choices=Image.ARCHS,
             help='architecture of the newly created image')
         create.set_defaults(func=self._create)
 
@@ -144,6 +145,9 @@ class ServiceInterface:
     '''An interface with the Raspberry PI image manager.'''
 
     def __init__(self, args):
+        # Create the data directory if it doesn't exist
+        if not os.path.isdir(args.data):
+            os.mkdir(args.data)
         self._rpifiles = RpiFiles(os.path.join(args.data, 'firmware'))
         self._gentoofiles = GentooFiles(os.path.join(args.data, 'gentoo'))
         self._image_manager = ImageManager(
@@ -528,14 +532,14 @@ class ImageManager:
 class Image:
     '''An image.'''
 
-    _ARCHS = ['armv6j', 'armv7a', 'aarch64']
+    ARCHS = ['armv6j', 'armv7a', 'aarch64']
 
     def __init__(
             self, name, arch, path, created=datetime.datetime.now(),
             firmware=None, parent=None):
         self.name = name
         # Check that the given arch is a valid one
-        if arch not in self._ARCHS:
+        if arch not in self.ARCHS:
             raise ValueError(f"unknown architecture '{arch}'")
         else:
             self.arch = arch
